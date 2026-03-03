@@ -9,6 +9,7 @@ from fastapi.websockets import WebSocketDisconnect
 from twilio.twiml.voice_response import VoiceResponse, Connect
 from dotenv import load_dotenv
 import uvicorn
+from urllib.parse import urlparse
 
 import google_calendar
 
@@ -23,6 +24,7 @@ OPENAI_REALTIME_MODEL = "gpt-4o-realtime-preview-2024-12-17"
 VOICE = "ash"
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Asia/Karachi")
 PORT = int(os.getenv("PORT", "8000"))
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
 
 SYSTEM_MESSAGE = """
 You are a realtime voice booking assistant that creates simple travel booking entries in Google Calendar.
@@ -147,16 +149,23 @@ async def index():
 async def incoming_call(request: Request):
     response = VoiceResponse()
 
-    # When running behind a proxy (Replit, etc.), prefer forwarded headers.
-    forwarded_host = request.headers.get("x-forwarded-host")
-    host = (forwarded_host or request.headers.get("host") or request.url.hostname or "").split(",")[0].strip()
-    forwarded_proto = request.headers.get("x-forwarded-proto")
-    proto = (forwarded_proto or request.url.scheme or "https").split(",")[0].strip().lower()
-    ws_scheme = "wss" if proto == "https" else "ws"
+    # Twilio Media Streams requires secure websockets (wss://) reachable from the public internet.
+    # Prefer an explicit public base URL when behind proxies (n8n, Replit, etc.).
+    host = ""
+    if PUBLIC_BASE_URL:
+        parsed = urlparse(PUBLIC_BASE_URL if "://" in PUBLIC_BASE_URL else f"https://{PUBLIC_BASE_URL}")
+        host = parsed.netloc or parsed.path
+
+    if not host:
+        forwarded_host = request.headers.get("x-forwarded-host")
+        host = (forwarded_host or request.headers.get("host") or request.url.hostname or "").split(",")[0].strip()
+
+    ws_url = f"wss://{host}/media-stream"
+    print(f"📞 incoming-call host={host} ws_url={ws_url}")
 
     connect = Connect()
     connect.stream(
-        url=f"{ws_scheme}://{host}/media-stream",
+        url=ws_url,
         track="both_tracks"  # 🔴 REQUIRED
     )
 
@@ -359,3 +368,4 @@ async def run_tool(name: str, args: dict) -> dict:
 # ================= RUN =================
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
