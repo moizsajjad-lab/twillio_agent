@@ -9,7 +9,6 @@ from fastapi.websockets import WebSocketDisconnect
 from twilio.twiml.voice_response import VoiceResponse, Connect
 from dotenv import load_dotenv
 import uvicorn
-from urllib.parse import urlparse
 
 import google_calendar
 
@@ -24,7 +23,6 @@ OPENAI_REALTIME_MODEL = "gpt-4o-realtime-preview-2024-12-17"
 VOICE = "ash"
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Asia/Karachi")
 PORT = int(os.getenv("PORT", "8000"))
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
 
 SYSTEM_MESSAGE = """
 You are a realtime voice booking assistant that creates simple travel booking entries in Google Calendar.
@@ -148,24 +146,11 @@ async def index():
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def incoming_call(request: Request):
     response = VoiceResponse()
-
-    # Twilio Media Streams requires secure websockets (wss://) reachable from the public internet.
-    # Prefer an explicit public base URL when behind proxies (n8n, Replit, etc.).
-    host = ""
-    if PUBLIC_BASE_URL:
-        parsed = urlparse(PUBLIC_BASE_URL if "://" in PUBLIC_BASE_URL else f"https://{PUBLIC_BASE_URL}")
-        host = parsed.netloc or parsed.path
-
-    if not host:
-        forwarded_host = request.headers.get("x-forwarded-host")
-        host = (forwarded_host or request.headers.get("host") or request.url.hostname or "").split(",")[0].strip()
-
-    ws_url = f"wss://{host}/media-stream"
-    print(f"📞 incoming-call host={host} ws_url={ws_url}")
+    host = request.url.hostname
 
     connect = Connect()
     connect.stream(
-        url=ws_url,
+        url=f"wss://{host}/media-stream",
         track="both_tracks"  # 🔴 REQUIRED
     )
 
@@ -183,7 +168,7 @@ async def handle_media_stream(websocket: WebSocket):
     await websocket.accept()
 
     async with websockets.connect(
-        f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}",
+        'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
         extra_headers={
             "Authorization": f"Bearer {OPENAI_API_KEY}",
             "OpenAI-Beta": "realtime=v1"
@@ -206,11 +191,6 @@ async def handle_media_stream(websocket: WebSocket):
                         print(f"▶ Stream started: {stream_sid}")
 
                     elif data["event"] == "media":
-                        # If Twilio is streaming both tracks, only forward inbound audio to the model.
-                        track = (data.get("media") or {}).get("track")
-                        if track and track != "inbound":
-                            continue
-
                         # 1️⃣ append audio
                         await openai_ws.send(json.dumps({
                             "type": "input_audio_buffer.append",
@@ -368,4 +348,3 @@ async def run_tool(name: str, args: dict) -> dict:
 # ================= RUN =================
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
-
