@@ -128,13 +128,14 @@ async def handle_media_stream(websocket: WebSocket):
     async with openai_conn as openai_ws:
 
         await send_session_update(openai_ws)
-        await send_greeting(openai_ws)
 
         stream_sid = None
         response_in_progress = False
+        greeting_sent = False
 
         async def receive_from_twilio():
             nonlocal stream_sid
+            nonlocal greeting_sent
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -142,6 +143,9 @@ async def handle_media_stream(websocket: WebSocket):
                     if data["event"] == "start":
                         stream_sid = data["start"]["streamSid"]
                         print(f"▶ Stream started: {stream_sid}")
+                        if not greeting_sent:
+                            await send_greeting(openai_ws)
+                            greeting_sent = True
 
                     elif data["event"] == "media":
                         # 1️⃣ append audio
@@ -152,14 +156,18 @@ async def handle_media_stream(websocket: WebSocket):
 
                     elif data["event"] == "stop":
                         print("⏹ Twilio stream stopped")
-                        if openai_ws.open:
+                        try:
                             await openai_ws.close()
+                        except Exception:
+                            pass
                         return
 
             except WebSocketDisconnect:
                 print("❌ Twilio disconnected")
-                if openai_ws.open:
+                try:
                     await openai_ws.close()
+                except Exception:
+                    pass
 
         async def send_to_twilio():
             nonlocal response_in_progress
