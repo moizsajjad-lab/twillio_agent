@@ -72,6 +72,12 @@ LOG_EVENT_TYPES = {
 
 app = FastAPI()
 
+def _get_public_host(request: Request) -> str:
+    # Prefer proxy-forwarded host (e.g., Replit/ingress) so Twilio gets a public WSS URL.
+    xf_host = request.headers.get("x-forwarded-host")
+    host = (xf_host.split(",")[0].strip() if xf_host else None) or request.headers.get("host") or request.url.hostname or ""
+    return host.split(":", 1)[0]
+
 # ================= HEALTH =================
 @app.api_route("/", methods=["GET"])
 async def index():
@@ -81,12 +87,12 @@ async def index():
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def incoming_call(request: Request):
     response = VoiceResponse()
-    host = request.url.hostname
+    host = _get_public_host(request)
 
     connect = Connect()
     connect.stream(
         url=f"wss://{host}/media-stream",
-        track="both_tracks"  # 🔴 REQUIRED
+        track="inbound_track"
     )
 
     response.append(connect)
