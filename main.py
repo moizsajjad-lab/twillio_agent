@@ -132,10 +132,21 @@ async def handle_media_stream(websocket: WebSocket):
         stream_sid = None
         response_in_progress = False
         greeting_sent = False
+        openai_ready = False
+        audio_delta_count = 0
+
+        async def maybe_send_greeting():
+            nonlocal greeting_sent
+            if greeting_sent:
+                return
+            if not stream_sid or not openai_ready:
+                return
+            print("👋 Sending greeting (OpenAI ready + streamSid set)")
+            await send_greeting(openai_ws)
+            greeting_sent = True
 
         async def receive_from_twilio():
             nonlocal stream_sid
-            nonlocal greeting_sent
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -143,9 +154,7 @@ async def handle_media_stream(websocket: WebSocket):
                     if data["event"] == "start":
                         stream_sid = data["start"]["streamSid"]
                         print(f"▶ Stream started: {stream_sid}")
-                        if not greeting_sent:
-                            await send_greeting(openai_ws)
-                            greeting_sent = True
+                        await maybe_send_greeting()
 
                     elif data["event"] == "media":
                         # 1️⃣ append audio
@@ -171,6 +180,8 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def send_to_twilio():
             nonlocal response_in_progress
+            nonlocal openai_ready
+            nonlocal audio_delta_count
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -180,6 +191,10 @@ async def handle_media_stream(websocket: WebSocket):
 
                     if r_type in LOG_EVENT_TYPES:
                         print("OpenAI:", r_type)
+
+                    if r_type == "session.created":
+                        openai_ready = True
+                        await maybe_send_greeting()
 
                     if "function" in r_type or "tool" in r_type:
                         print("🔎 Tool-ish event:", response)
@@ -243,6 +258,9 @@ async def handle_media_stream(websocket: WebSocket):
                                 await handle_function_call(openai_ws, call_id, fn_name, args_str)
 
                     if r_type == "response.audio.delta" and stream_sid:
+                        audio_delta_count += 1
+                        if audio_delta_count == 1:
+                            print("🔊 First audio delta -> sending to Twilio")
                         audio_payload = base64.b64encode(
                             base64.b64decode(response["delta"])
                         ).decode("utf-8")
@@ -270,7 +288,7 @@ async def send_session_update(openai_ws):
     await openai_ws.send(json.dumps({
         "type": "session.update",
         "session": {
-            "turn_detection": {"type": "server_vad"},
+            "turn_detection": {"type": "server_vad", "create_response": True},
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
             "voice": VOICE,
