@@ -89,13 +89,14 @@ async def incoming_call(request: Request):
     response = VoiceResponse()
     host = _get_public_host(request)
 
+    response.say("Connecting you now")
     connect = Connect()
     connect.stream(
         url=f"wss://{host}/media-stream",
         track="inbound_track"
     )
-
     response.append(connect)
+    response.pause(length=60)
 
     return Response(
         content=str(response),
@@ -125,182 +126,199 @@ async def handle_media_stream(websocket: WebSocket):
             extra_headers=openai_headers,
         )
 
-    async with openai_conn as openai_ws:
+    try:
+        async with openai_conn as openai_ws:
+            await send_session_update(openai_ws)
 
-        await send_session_update(openai_ws)
+            stream_sid = None
+            response_in_progress = False
+            greeting_sent = False
+            openai_ready = False
+            audio_delta_count = 0
+            media_packets_received = 0
+            last_openai_message = None
+            session_created_at = None
 
-        stream_sid = None
-        response_in_progress = False
-        greeting_sent = False
-        openai_ready = False
-        audio_delta_count = 0
-        media_packets_received = 0
+            async def maybe_send_greeting():
+                nonlocal greeting_sent
+                if greeting_sent:
+                    return
+                if not stream_sid or not openai_ready:
+                    return
+                print("👋 response.create (greeting) sent")
+                await send_greeting(openai_ws)
+                greeting_sent = True
 
-        async def maybe_send_greeting():
-            nonlocal greeting_sent
-            if greeting_sent:
-                return
-            if not stream_sid or not openai_ready:
-                return
-            print("👋 response.create (greeting) sent")
-            await send_greeting(openai_ws)
-            greeting_sent = True
-
-        async def receive_from_twilio():
-            nonlocal stream_sid
-            nonlocal media_packets_received
-            try:
-                async for message in websocket.iter_text():
-                    data = json.loads(message)
-
-                    if data["event"] == "start":
-                        start = data.get("start", {})
-                        stream_sid = start.get("streamSid")
-                        call_sid = start.get("callSid")
-                        print(f"▶ Stream started: streamSid={stream_sid} callSid={call_sid or 'n/a'}")
-                        await maybe_send_greeting()
-
-                    elif data["event"] == "media":
-                        media_packets_received += 1
-                        if media_packets_received <= 3:
-                            print(f"📦 media packet {media_packets_received}/3 received")
-                        await openai_ws.send(json.dumps({
-                            "type": "input_audio_buffer.append",
-                            "audio": data["media"]["payload"]
-                        }))
-
-                    elif data["event"] == "stop":
-                        reason = (data.get("stop") or data)
-                        if isinstance(reason, dict):
-                            reason = reason.get("reason", reason)
-                        print(f"⏹ Twilio stream stopped: {reason}")
-                        try:
-                            await openai_ws.close()
-                        except Exception:
-                            pass
-                        return
-
-            except WebSocketDisconnect:
-                print("❌ Twilio disconnected")
+            async def receive_from_twilio():
+                nonlocal stream_sid
+                nonlocal media_packets_received
                 try:
-                    await openai_ws.close()
-                except Exception:
-                    pass
+                    async for message in websocket.iter_text():
+                        data = json.loads(message)
 
-        async def send_to_twilio():
-            nonlocal response_in_progress
-            nonlocal openai_ready
-            nonlocal audio_delta_count
-            try:
-                async for openai_message in openai_ws:
-                    response = json.loads(openai_message)
-                    r_type = response.get("type")
-                    if not r_type:
-                        continue
+                        if data["event"] == "start":
+                            start = data.get("start", {})
+                            stream_sid = start.get("streamSid")
+                            call_sid = start.get("callSid")
+                            print(f"▶ Stream started: streamSid={stream_sid} callSid={call_sid or 'n/a'}")
+                            await maybe_send_greeting()
 
-                    if r_type in LOG_EVENT_TYPES:
-                        print("OpenAI:", r_type)
+                        elif data["event"] == "media":
+                            media_packets_received += 1
+                            if media_packets_received <= 3:
+                                print(f"📦 media packet {media_packets_received}/3 received")
+                            await openai_ws.send(json.dumps({
+                                "type": "input_audio_buffer.append",
+                                "audio": data["media"]["payload"]
+                            }))
 
-                    if r_type == "session.updated":
-                        openai_ready = True
-                        await maybe_send_greeting()
-                    if r_type == "session.created":
-                        async def _delayed_greeting():
-                            await asyncio.sleep(0.5)
-                            nonlocal openai_ready
-                            if greeting_sent:
-                                return
+                        elif data["event"] == "stop":
+                            reason = (data.get("stop") or data)
+                            if isinstance(reason, dict):
+                                reason = reason.get("reason", reason)
+                            print(f"⏹ Twilio stream stopped: {reason}")
+                            try:
+                                await openai_ws.close()
+                            except Exception:
+                                pass
+                            return
+
+                except WebSocketDisconnect:
+                    print("❌ Twilio disconnected")
+                    try:
+                        await openai_ws.close()
+                    except Exception:
+                        pass
+
+            async def send_to_twilio():
+                nonlocal response_in_progress
+                nonlocal openai_ready
+                nonlocal audio_delta_count
+                nonlocal last_openai_message
+                nonlocal session_created_at
+                try:
+                    async for openai_message in openai_ws:
+                        response = json.loads(openai_message)
+                        r_type = response.get("type")
+                        last_openai_message = response
+
+                        if not r_type:
+                            continue
+
+                        print("OpenAI event:", r_type)
+
+                        if "error" in (r_type or "") or response.get("error"):
+                            print("OpenAI ERROR (full):", json.dumps(response, indent=2))
+
+                        if r_type == "session.created":
+                            session_created_at = asyncio.get_event_loop().time()
+
+                            async def _warn_if_no_session_updated():
+                                await asyncio.sleep(2.0)
+                                if openai_ready:
+                                    return
+                                print("⚠️ session.updated never arrived within 2s. Last OpenAI message:", json.dumps(last_openai_message, indent=2)[:500])
+                            asyncio.create_task(_warn_if_no_session_updated())
+
+                        if r_type == "session.updated":
                             openai_ready = True
                             await maybe_send_greeting()
-                        asyncio.create_task(_delayed_greeting())
 
-                    if "function" in r_type or "tool" in r_type:
-                        print("🔎 Tool-ish event:", response)
+                        if "function" in r_type or "tool" in r_type:
+                            print("🔎 Tool-ish event:", response)
 
-                    if r_type == "response.created":
-                        response_in_progress = True
-                    elif r_type == "response.done":
-                        print(f"OpenAI: response.done (total audio deltas so far: {audio_delta_count})")
-                        response_in_progress = False
+                        if r_type == "response.created":
+                            response_in_progress = True
+                        elif r_type == "response.done":
+                            print(f"OpenAI: response.done (total audio deltas so far: {audio_delta_count})")
+                            response_in_progress = False
 
-                    if r_type == "input_audio_buffer.speech_stopped":
-                        try:
-                            await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                        except Exception as e:
-                            print("input_audio_buffer.commit failed:", e)
-
-                    # Barge-in: stop current TTS immediately when user starts speaking.
-                    if r_type == "input_audio_buffer.speech_started":
-                        if response_in_progress:
+                        if r_type == "input_audio_buffer.speech_stopped":
                             try:
-                                await openai_ws.send(json.dumps({"type": "response.cancel"}))
+                                await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                             except Exception as e:
-                                print("response.cancel failed:", e)
+                                print("input_audio_buffer.commit failed:", e)
 
-                    # Tool calling: accumulate arguments until done, then execute tool and return output.
-                    if r_type == "response.output_item.added":
-                        item = response.get("item") or {}
-                        if item.get("type") == "function_call":
-                            call_id = item.get("call_id") or item.get("id")
+                        # Barge-in: stop current TTS immediately when user starts speaking.
+                        if r_type == "input_audio_buffer.speech_started":
+                            if response_in_progress:
+                                try:
+                                    await openai_ws.send(json.dumps({"type": "response.cancel"}))
+                                except Exception as e:
+                                    print("response.cancel failed:", e)
+
+                        # Tool calling: accumulate arguments until done, then execute tool and return output.
+                        if r_type == "response.output_item.added":
+                            item = response.get("item") or {}
+                            if item.get("type") == "function_call":
+                                call_id = item.get("call_id") or item.get("id")
+                                if call_id:
+                                    call_buffers.setdefault(call_id, {"name": item.get("name"), "buf": ""})
+
+                        if r_type == "response.function_call_arguments.delta":
+                            call_id = response.get("call_id")
                             if call_id:
-                                call_buffers.setdefault(call_id, {"name": item.get("name"), "buf": ""})
+                                entry = call_buffers.setdefault(call_id, {"name": response.get("name"), "buf": ""})
+                                if not entry.get("name") and response.get("name"):
+                                    entry["name"] = response.get("name")
+                                entry["buf"] += response.get("delta") or ""
 
-                    if r_type == "response.function_call_arguments.delta":
-                        call_id = response.get("call_id")
-                        if call_id:
-                            entry = call_buffers.setdefault(call_id, {"name": response.get("name"), "buf": ""})
-                            if not entry.get("name") and response.get("name"):
-                                entry["name"] = response.get("name")
-                            entry["buf"] += response.get("delta") or ""
-
-                    if r_type == "response.function_call_arguments.done":
-                        call_id = response.get("call_id")
-                        if call_id:
-                            if call_id in handled_call_ids:
-                                continue
-                            handled_call_ids.add(call_id)
-                            entry = call_buffers.pop(call_id, {"name": response.get("name"), "buf": ""})
-                            fn_name = response.get("name") or entry.get("name")
-                            args_str = response.get("arguments") or entry.get("buf") or ""
-                            await handle_function_call(openai_ws, call_id, fn_name, args_str)
-
-                    if r_type == "response.output_item.done":
-                        item = response.get("item") or {}
-                        if item.get("type") == "function_call":
-                            call_id = item.get("call_id") or item.get("id")
-                            fn_name = item.get("name")
-                            args_str = item.get("arguments") or ""
+                        if r_type == "response.function_call_arguments.done":
+                            call_id = response.get("call_id")
                             if call_id:
                                 if call_id in handled_call_ids:
                                     continue
                                 handled_call_ids.add(call_id)
+                                entry = call_buffers.pop(call_id, {"name": response.get("name"), "buf": ""})
+                                fn_name = response.get("name") or entry.get("name")
+                                args_str = response.get("arguments") or entry.get("buf") or ""
                                 await handle_function_call(openai_ws, call_id, fn_name, args_str)
 
-                    if r_type == "response.audio.delta" and stream_sid:
-                        audio_delta_count += 1
-                        if audio_delta_count == 1:
-                            print("🔊 first audio delta -> sending to Twilio")
-                        await websocket.send_json({
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {"payload": response["delta"]}
-                        })
+                        if r_type == "response.output_item.done":
+                            item = response.get("item") or {}
+                            if item.get("type") == "function_call":
+                                call_id = item.get("call_id") or item.get("id")
+                                fn_name = item.get("name")
+                                args_str = item.get("arguments") or ""
+                                if call_id:
+                                    if call_id in handled_call_ids:
+                                        continue
+                                    handled_call_ids.add(call_id)
+                                    await handle_function_call(openai_ws, call_id, fn_name, args_str)
 
-            except Exception as e:
-                print("OpenAI error:", e)
+                        if r_type == "response.audio.delta" and stream_sid:
+                            audio_delta_count += 1
+                            if audio_delta_count == 1:
+                                print("🔊 first audio delta -> sending to Twilio")
+                            await websocket.send_json({
+                                "event": "media",
+                                "streamSid": stream_sid,
+                                "media": {"payload": response["delta"]}
+                            })
 
-        # Keep tool buffers local to this call.
-        call_buffers: Dict[str, Dict[str, str]] = {}
-        handled_call_ids: set[str] = set()
+                    code = getattr(openai_ws, "close_code", None)
+                    reason = getattr(openai_ws, "close_reason", None) or ""
+                    print(f"OpenAI websocket closed code={code} reason={reason}")
 
-        await asyncio.gather(
-            receive_from_twilio(),
-            send_to_twilio()
-        )
+                except Exception as e:
+                    print("OpenAI error (send_to_twilio):", e)
+
+            # Keep tool buffers local to this call.
+            call_buffers: Dict[str, Dict[str, str]] = {}
+            handled_call_ids: set[str] = set()
+
+            await asyncio.gather(
+                receive_from_twilio(),
+                send_to_twilio()
+            )
+
+    except Exception as e:
+        print("OpenAI connection error:", e)
+    print("OpenAI connection ended; Twilio websocket may still be open.")
 
 # ================= OPENAI SETUP =================
 async def send_session_update(openai_ws):
-    await openai_ws.send(json.dumps({
+    payload = {
         "type": "session.update",
         "session": {
             "turn_detection": {"type": "server_vad", "create_response": True},
@@ -392,7 +410,9 @@ async def send_session_update(openai_ws):
                 }
             ]
         }
-    }))
+    }
+    await openai_ws.send(json.dumps(payload))
+    print("session.update sent")
 
 async def send_greeting(openai_ws):
     await openai_ws.send(json.dumps({
