@@ -92,7 +92,7 @@ async def incoming_call(request: Request):
     connect = Connect()
     connect.stream(
         url=f"wss://{host}/media-stream",
-        track="inbound_track"
+        track="both_tracks"
     )
 
     response.append(connect)
@@ -132,7 +132,7 @@ async def handle_media_stream(websocket: WebSocket):
         stream_sid = None
         response_in_progress = False
         greeting_sent = False
-        openai_ready = False
+        openai_ready = True  # allow greeting as soon as Twilio sends "start" (streamSid set)
         audio_delta_count = 0
 
         async def maybe_send_greeting():
@@ -192,9 +192,16 @@ async def handle_media_stream(websocket: WebSocket):
                     if r_type in LOG_EVENT_TYPES:
                         print("OpenAI:", r_type)
 
-                    # Wait for session.updated (config applied) so voice/format are ready for TTS
+                    # Prefer session.updated (config applied). Fallback: greet 0.5s after session.created so Twilio doesn't drop before we speak.
                     if r_type == "session.created":
-                        pass  # not ready until session.updated
+                        async def _delayed_greeting():
+                            await asyncio.sleep(0.5)
+                            nonlocal openai_ready
+                            if greeting_sent:
+                                return
+                            openai_ready = True
+                            await maybe_send_greeting()
+                        asyncio.create_task(_delayed_greeting())
                     if r_type == "session.updated":
                         openai_ready = True
                         await maybe_send_greeting()
