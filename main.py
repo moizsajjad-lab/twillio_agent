@@ -92,7 +92,7 @@ async def incoming_call(request: Request):
     connect = Connect()
     connect.stream(
         url=f"wss://{host}/media-stream",
-        track="both_tracks"
+        track="inbound_track"
     )
 
     response.append(connect)
@@ -132,8 +132,9 @@ async def handle_media_stream(websocket: WebSocket):
         stream_sid = None
         response_in_progress = False
         greeting_sent = False
-        openai_ready = True  # allow greeting as soon as Twilio sends "start" (streamSid set)
+        openai_ready = False
         audio_delta_count = 0
+        media_packets_received = 0
 
         async def maybe_send_greeting():
             nonlocal greeting_sent
@@ -141,30 +142,38 @@ async def handle_media_stream(websocket: WebSocket):
                 return
             if not stream_sid or not openai_ready:
                 return
-            print("👋 Sending greeting (OpenAI ready + streamSid set)")
+            print("👋 response.create (greeting) sent")
             await send_greeting(openai_ws)
             greeting_sent = True
 
         async def receive_from_twilio():
             nonlocal stream_sid
+            nonlocal media_packets_received
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
 
                     if data["event"] == "start":
-                        stream_sid = data["start"]["streamSid"]
-                        print(f"▶ Stream started: {stream_sid}")
+                        start = data.get("start", {})
+                        stream_sid = start.get("streamSid")
+                        call_sid = start.get("callSid")
+                        print(f"▶ Stream started: streamSid={stream_sid} callSid={call_sid or 'n/a'}")
                         await maybe_send_greeting()
 
                     elif data["event"] == "media":
-                        # 1️⃣ append audio
+                        media_packets_received += 1
+                        if media_packets_received <= 3:
+                            print(f"📦 media packet {media_packets_received}/3 received")
                         await openai_ws.send(json.dumps({
                             "type": "input_audio_buffer.append",
                             "audio": data["media"]["payload"]
                         }))
 
                     elif data["event"] == "stop":
-                        print("⏹ Twilio stream stopped")
+                        reason = (data.get("stop") or data)
+                        if isinstance(reason, dict):
+                            reason = reason.get("reason", reason)
+                        print(f"⏹ Twilio stream stopped: {reason}")
                         try:
                             await openai_ws.close()
                         except Exception:
@@ -192,7 +201,9 @@ async def handle_media_stream(websocket: WebSocket):
                     if r_type in LOG_EVENT_TYPES:
                         print("OpenAI:", r_type)
 
-                    # Prefer session.updated (config applied). Fallback: greet 0.5s after session.created so Twilio doesn't drop before we speak.
+                    if r_type == "session.updated":
+                        openai_ready = True
+                        await maybe_send_greeting()
                     if r_type == "session.created":
                         async def _delayed_greeting():
                             await asyncio.sleep(0.5)
@@ -202,9 +213,6 @@ async def handle_media_stream(websocket: WebSocket):
                             openai_ready = True
                             await maybe_send_greeting()
                         asyncio.create_task(_delayed_greeting())
-                    if r_type == "session.updated":
-                        openai_ready = True
-                        await maybe_send_greeting()
 
                     if "function" in r_type or "tool" in r_type:
                         print("🔎 Tool-ish event:", response)
@@ -212,6 +220,7 @@ async def handle_media_stream(websocket: WebSocket):
                     if r_type == "response.created":
                         response_in_progress = True
                     elif r_type == "response.done":
+                        print(f"OpenAI: response.done (total audio deltas so far: {audio_delta_count})")
                         response_in_progress = False
 
                     if r_type == "input_audio_buffer.speech_stopped":
@@ -270,15 +279,11 @@ async def handle_media_stream(websocket: WebSocket):
                     if r_type == "response.audio.delta" and stream_sid:
                         audio_delta_count += 1
                         if audio_delta_count == 1:
-                            print("🔊 First audio delta -> sending to Twilio")
-                        audio_payload = base64.b64encode(
-                            base64.b64decode(response["delta"])
-                        ).decode("utf-8")
-
+                            print("🔊 first audio delta -> sending to Twilio")
                         await websocket.send_json({
                             "event": "media",
                             "streamSid": stream_sid,
-                            "media": {"payload": audio_payload}
+                            "media": {"payload": response["delta"]}
                         })
 
             except Exception as e:
