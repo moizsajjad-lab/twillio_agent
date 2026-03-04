@@ -192,7 +192,10 @@ async def handle_media_stream(websocket: WebSocket):
                     if r_type in LOG_EVENT_TYPES:
                         print("OpenAI:", r_type)
 
+                    # Wait for session.updated (config applied) so voice/format are ready for TTS
                     if r_type == "session.created":
+                        pass  # not ready until session.updated
+                    if r_type == "session.updated":
                         openai_ready = True
                         await maybe_send_greeting()
 
